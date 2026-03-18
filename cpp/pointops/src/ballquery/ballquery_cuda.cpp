@@ -10,24 +10,8 @@ All Rights Reserved 2022.
 #include "ballquery_cuda_kernel.h"
 
 
-#define CHECK_CUDA(x)                                                               \
-  do                                                                                \
-  {                                                                                 \
-    if (!x.type().is_cuda())                                                        \
-    {                                                                               \
-      fprintf(stderr, "%s must be CUDA tensor at %s:%d\n", #x, __FILE__, __LINE__); \
-      exit(-1);                                                                     \
-    }                                                                               \
-  } while (0)
-#define CHECK_CONTIGUOUS(x)                                                               \
-  do                                                                                      \
-  {                                                                                       \
-    if (!x.is_contiguous())                                                               \
-    {                                                                                     \
-      fprintf(stderr, "%s must be contiguous tensor at %s:%d\n", #x, __FILE__, __LINE__); \
-      exit(-1);                                                                           \
-    }                                                                                     \
-  } while (0)
+#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) \
   CHECK_CUDA(x);       \
   CHECK_CONTIGUOUS(x)

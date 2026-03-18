@@ -2,6 +2,17 @@ import torch
 import emd_cuda
 
 
+def _allow_in_graph(fn):
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "allow_in_graph"):
+        return compiler.allow_in_graph(fn)
+    try:
+        from torch._dynamo import allow_in_graph as dynamo_allow_in_graph
+    except Exception:
+        return fn
+    return dynamo_allow_in_graph(fn)
+
+
 class EarthMoverDistanceFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, xyz1, xyz2):
@@ -19,6 +30,9 @@ class EarthMoverDistanceFunction(torch.autograd.Function):
         grad_cost = grad_cost.contiguous()
         grad_xyz1, grad_xyz2 = emd_cuda.matchcost_backward(grad_cost, xyz1, xyz2, match)
         return grad_xyz1, grad_xyz2
+
+
+earth_mover_distance_apply = _allow_in_graph(EarthMoverDistanceFunction.apply)
 
 
 
@@ -43,7 +57,7 @@ class earth_mover_distance(torch.nn.Module):
 
         """
 
-        cost = EarthMoverDistanceFunction.apply(xyz1, xyz2)
+        cost = earth_mover_distance_apply(xyz1, xyz2)
         cost = cost / xyz1.size(1)
         
         return cost.mean()

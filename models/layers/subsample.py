@@ -8,6 +8,37 @@ import math
 from openpoints.cpp.pointnet2_batch import pointnet2_cuda
 
 
+def _allow_in_graph(fn):
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "allow_in_graph"):
+        return compiler.allow_in_graph(fn)
+    try:
+        from torch._dynamo import allow_in_graph as dynamo_allow_in_graph
+    except Exception:
+        return fn
+    return dynamo_allow_in_graph(fn)
+
+
+def _furthest_point_sample_cuda_impl(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+    assert xyz.is_contiguous()
+    B, N, _ = xyz.size()
+    npoint = int(npoint)
+    output = torch.empty((B, npoint), device=xyz.device, dtype=torch.int32)
+    temp = torch.full((B, N), 1e10, device=xyz.device, dtype=torch.float32)
+    pointnet2_cuda.furthest_point_sampling_wrapper(B, N, npoint, xyz, temp, output)
+    return output
+
+
+if not (hasattr(torch.ops, "openpoints") and hasattr(torch.ops.openpoints, "furthest_point_sample")):
+    @torch.library.custom_op("openpoints::furthest_point_sample", mutates_args=())
+    def _furthest_point_sample_op(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+        return _furthest_point_sample_cuda_impl(xyz, npoint)
+
+    @_furthest_point_sample_op.register_fake
+    def _(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+        return torch.empty((xyz.shape[0], npoint), device=xyz.device, dtype=torch.int32)
+
+
 class BaseSampler(ABC):
     """If num_to_sample is provided, sample exactly
         num_to_sample points. Otherwise sample floor(pos[0] * ratio) points
@@ -85,24 +116,15 @@ class FurthestPointSampling(Function):
         :return:
              output: (B, npoint) tensor containing the set (idx)
         """
-        assert xyz.is_contiguous()
-
-        B, N, _ = xyz.size()
-        # output = torch.cuda.IntTensor(B, npoint, device=xyz.device)
-        # temp = torch.cuda.FloatTensor(B, N, device=xyz.device).fill_(1e10)
-        output = torch.cuda.IntTensor(B, npoint)
-        temp = torch.cuda.FloatTensor(B, N).fill_(1e10)
-
-        pointnet2_cuda.furthest_point_sampling_wrapper(
-            B, N, npoint, xyz, temp, output)
-        return output
+        return _furthest_point_sample_cuda_impl(xyz, npoint)
 
     @staticmethod
     def backward(xyz, a=None):
         return None, None
 
 
-furthest_point_sample = FurthestPointSampling.apply
+def furthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+    return torch.ops.openpoints.furthest_point_sample(xyz, npoint)
 
 
 class GatherOperation(Function):
@@ -120,7 +142,7 @@ class GatherOperation(Function):
 
         B, npoint = idx.size()
         _, C, N = features.size()
-        output = torch.cuda.FloatTensor(B, C, npoint, device=features.device)
+        output = torch.empty((B, C, npoint), device=features.device, dtype=torch.float32)
 
         pointnet2_cuda.gather_points_wrapper(
             B, C, N, npoint, features, idx, output)
@@ -133,15 +155,14 @@ class GatherOperation(Function):
         idx, C, N = ctx.for_backwards
         B, npoint = idx.size()
 
-        grad_features = torch.zeros(
-            [B, C, N], dtype=torch.float, device=grad_out.device, requires_grad=True)
-        grad_out_data = grad_out.data.contiguous()
+        grad_features = torch.zeros((B, C, N), dtype=grad_out.dtype, device=grad_out.device)
+        grad_out_data = grad_out.contiguous()
         pointnet2_cuda.gather_points_grad_wrapper(
-            B, C, N, npoint, grad_out_data, idx, grad_features.data)
+            B, C, N, npoint, grad_out_data, idx, grad_features)
         return grad_features, None
 
 
-gather_operation = GatherOperation.apply
+gather_operation = _allow_in_graph(GatherOperation.apply)
 # mark: torch gather is even faster. sampled_xyz = torch.gather(points, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
 
 

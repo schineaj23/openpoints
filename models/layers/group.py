@@ -9,6 +9,90 @@ import torch.nn as nn
 from torch.autograd import Function
 from openpoints.cpp import pointnet2_cuda
 
+
+def _allow_in_graph(fn):
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "allow_in_graph"):
+        return compiler.allow_in_graph(fn)
+    try:
+        from torch._dynamo import allow_in_graph as dynamo_allow_in_graph
+    except Exception:
+        return fn
+    return dynamo_allow_in_graph(fn)
+
+
+def _is_compiling_or_fake(*tensors: torch.Tensor) -> bool:
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "is_compiling") and dynamo.is_compiling():
+        return True
+    try:
+        from torch._subclasses.fake_tensor import is_fake
+    except Exception:
+        return False
+    return any(is_fake(t) for t in tensors if isinstance(t, torch.Tensor))
+
+
+def _ball_query_cuda_impl(radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
+    assert new_xyz.is_contiguous()
+    assert xyz.is_contiguous()
+    B, N, _ = xyz.size()
+    npoint = new_xyz.size(1)
+    idx = torch.zeros((B, npoint, int(nsample)), device=xyz.device, dtype=torch.int32)
+    pointnet2_cuda.ball_query_wrapper(B, N, npoint, float(radius), int(nsample), new_xyz, xyz, idx)
+    return idx
+
+
+def _group_points_cuda_impl(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    assert features.is_contiguous()
+    assert idx.is_contiguous()
+    B, nfeatures, nsample = idx.size()
+    _, C, N = features.size()
+    output = torch.empty((B, C, nfeatures, nsample), device=features.device, dtype=torch.float32)
+    pointnet2_cuda.group_points_wrapper(B, C, N, nfeatures, nsample, features, idx, output)
+    return output
+
+
+def _gather_points_cuda_impl(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    assert features.is_contiguous()
+    assert idx.is_contiguous()
+    B, npoint = idx.size()
+    _, C, N = features.size()
+    output = torch.empty((B, C, npoint), device=features.device, dtype=torch.float32)
+    pointnet2_cuda.gather_points_wrapper(B, C, N, npoint, features, idx, output)
+    return output
+
+
+if not (hasattr(torch.ops, "openpoints") and hasattr(torch.ops.openpoints, "ball_query")):
+    @torch.library.custom_op("openpoints::ball_query", mutates_args=())
+    def _ball_query_op(new_xyz: torch.Tensor, xyz: torch.Tensor, radius: float, nsample: int) -> torch.Tensor:
+        return _ball_query_cuda_impl(radius, nsample, xyz, new_xyz)
+
+    @_ball_query_op.register_fake
+    def _(new_xyz: torch.Tensor, xyz: torch.Tensor, radius: float, nsample: int) -> torch.Tensor:
+        return torch.empty((xyz.shape[0], new_xyz.shape[1], nsample), device=xyz.device, dtype=torch.int32)
+
+
+if not (hasattr(torch.ops, "openpoints") and hasattr(torch.ops.openpoints, "group_points")):
+    @torch.library.custom_op("openpoints::group_points", mutates_args=())
+    def _group_points_op(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        return _group_points_cuda_impl(features, idx)
+
+    @_group_points_op.register_fake
+    def _(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        return torch.empty((features.shape[0], features.shape[1], idx.shape[1], idx.shape[2]),
+                           device=features.device, dtype=torch.float32)
+
+
+if not (hasattr(torch.ops, "openpoints") and hasattr(torch.ops.openpoints, "gather_points")):
+    @torch.library.custom_op("openpoints::gather_points", mutates_args=())
+    def _gather_points_op(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        return _gather_points_cuda_impl(features, idx)
+
+    @_gather_points_op.register_fake
+    def _(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        return torch.empty((features.shape[0], features.shape[1], idx.shape[1]),
+                           device=features.device, dtype=torch.float32)
+
 class KNN(nn.Module):
     def __init__(self, neighbors, transpose_mode=True):
         super(KNN, self).__init__()
@@ -76,7 +160,7 @@ class DilatedKNN(nn.Module):
 class GroupingOperation(Function):
 
     @staticmethod
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(ctx, features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """
         :param ctx:
@@ -88,12 +172,9 @@ class GroupingOperation(Function):
         assert features.is_contiguous()
         assert idx.is_contiguous()
 
-        B, nfeatures, nsample = idx.size()
-        _, C, N = features.size()
-        output = torch.cuda.FloatTensor(B, C, nfeatures, nsample, device=features.device)
+        output = _group_points_cuda_impl(features, idx)
 
-        pointnet2_cuda.group_points_wrapper(B, C, N, nfeatures, nsample, features, idx, output)
-
+        _, _, N = features.size()
         ctx.for_backwards = (idx, N)
         return output
 
@@ -108,13 +189,16 @@ class GroupingOperation(Function):
         idx, N = ctx.for_backwards
 
         B, C, npoint, nsample = grad_out.size()
-        grad_features = torch.zeros([B, C, N], dtype=torch.float, device=grad_out.device, requires_grad=True)
-        grad_out_data = grad_out.data.contiguous()
-        pointnet2_cuda.group_points_grad_wrapper(B, C, N, npoint, nsample, grad_out_data, idx, grad_features.data)
+        grad_features = torch.zeros((B, C, N), dtype=grad_out.dtype, device=grad_out.device)
+        grad_out_data = grad_out.contiguous()
+        pointnet2_cuda.group_points_grad_wrapper(B, C, N, npoint, nsample, grad_out_data, idx, grad_features)
         return grad_features, None
 
 
-grouping_operation = GroupingOperation.apply
+def grouping_operation(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    if _is_compiling_or_fake(features, idx):
+        return torch.ops.openpoints.group_points(features, idx)
+    return GroupingOperation.apply(features, idx)
 
 
 def torch_grouping_operation(features, idx):
@@ -151,12 +235,9 @@ class GatherOperation(Function):
         assert features.is_contiguous()
         assert idx.is_contiguous()
 
-        B, npoint = idx.size()
+        output = _gather_points_cuda_impl(features, idx)
+
         _, C, N = features.size()
-        output = torch.cuda.FloatTensor(B, C, npoint, device=features.device)
-
-        pointnet2_cuda.gather_points_wrapper(B, C, N, npoint, features, idx, output)
-
         ctx.for_backwards = (idx, C, N)
         return output
 
@@ -165,13 +246,16 @@ class GatherOperation(Function):
         idx, C, N = ctx.for_backwards
         B, npoint = idx.size()
 
-        grad_features = torch.zeros([B, C, N], dtype=torch.float, device=grad_out.device, requires_grad=True)
-        grad_out_data = grad_out.data.contiguous()
-        pointnet2_cuda.gather_points_grad_wrapper(B, C, N, npoint, grad_out_data, idx, grad_features.data)
+        grad_features = torch.zeros((B, C, N), dtype=grad_out.dtype, device=grad_out.device)
+        grad_out_data = grad_out.contiguous()
+        pointnet2_cuda.gather_points_grad_wrapper(B, C, N, npoint, grad_out_data, idx, grad_features)
         return grad_features, None
 
 
-gather_operation = GatherOperation.apply
+def gather_operation(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    if _is_compiling_or_fake(features, idx):
+        return torch.ops.openpoints.gather_points(features, idx)
+    return GatherOperation.apply(features, idx)
 
 
 class BallQuery(Function):
@@ -186,21 +270,15 @@ class BallQuery(Function):
         :return:
             idx: (B, npoint, nsample) tensor with the indicies of the features that form the query balls
         """
-        assert new_xyz.is_contiguous()
-        assert xyz.is_contiguous()
-
-        B, N, _ = xyz.size()
-        npoint = new_xyz.size(1)
-        idx = torch.cuda.IntTensor(B, npoint, nsample, device=xyz.device).zero_()
-        pointnet2_cuda.ball_query_wrapper(B, N, npoint, radius, nsample, new_xyz, xyz, idx)
-        return idx
+        return _ball_query_cuda_impl(radius, nsample, xyz, new_xyz)
 
     @staticmethod
     def backward(ctx, a=None):
         return None, None, None, None
 
 
-ball_query = BallQuery.apply
+def ball_query(radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
+    return torch.ops.openpoints.ball_query(new_xyz, xyz, float(radius), int(nsample))
 
 
 class QueryAndGroup(nn.Module):

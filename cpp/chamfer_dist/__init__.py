@@ -10,6 +10,17 @@ import torch
 import chamfer
 
 
+def _allow_in_graph(fn):
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "allow_in_graph"):
+        return compiler.allow_in_graph(fn)
+    try:
+        from torch._dynamo import allow_in_graph as dynamo_allow_in_graph
+    except Exception:
+        return fn
+    return dynamo_allow_in_graph(fn)
+
+
 class ChamferFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, xyz1, xyz2):
@@ -23,6 +34,9 @@ class ChamferFunction(torch.autograd.Function):
         xyz1, xyz2, idx1, idx2 = ctx.saved_tensors
         grad_xyz1, grad_xyz2 = chamfer.backward(xyz1, xyz2, idx1, idx2, grad_dist1, grad_dist2)
         return grad_xyz1, grad_xyz2
+
+
+chamfer_apply = _allow_in_graph(ChamferFunction.apply)
 
 
 class ChamferDistanceL2(torch.nn.Module):
@@ -40,7 +54,7 @@ class ChamferDistanceL2(torch.nn.Module):
             xyz1 = xyz1[non_zeros1].unsqueeze(dim=0)
             xyz2 = xyz2[non_zeros2].unsqueeze(dim=0)
 
-        dist1, dist2 = ChamferFunction.apply(xyz1, xyz2)
+        dist1, dist2 = chamfer_apply(xyz1, xyz2)
         return torch.mean(dist1) + torch.mean(dist2)
 
 class ChamferDistanceL2_split(torch.nn.Module):
@@ -58,7 +72,7 @@ class ChamferDistanceL2_split(torch.nn.Module):
             xyz1 = xyz1[non_zeros1].unsqueeze(dim=0)
             xyz2 = xyz2[non_zeros2].unsqueeze(dim=0)
 
-        dist1, dist2 = ChamferFunction.apply(xyz1, xyz2)
+        dist1, dist2 = chamfer_apply(xyz1, xyz2)
         return torch.mean(dist1), torch.mean(dist2)
 
 class ChamferDistanceL1(torch.nn.Module):
@@ -76,7 +90,7 @@ class ChamferDistanceL1(torch.nn.Module):
             xyz1 = xyz1[non_zeros1].unsqueeze(dim=0)
             xyz2 = xyz2[non_zeros2].unsqueeze(dim=0)
 
-        dist1, dist2 = ChamferFunction.apply(xyz1, xyz2)
+        dist1, dist2 = chamfer_apply(xyz1, xyz2)
         # import pdb
         # pdb.set_trace()
         dist1 = torch.sqrt(dist1)

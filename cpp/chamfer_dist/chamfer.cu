@@ -149,12 +149,14 @@ std::vector<torch::Tensor> chamfer_cuda_forward(torch::Tensor xyz1,
   const int batch_size = xyz1.size(0);
   const int n          = xyz1.size(1);  // num_points point cloud A
   const int m          = xyz2.size(1);  // num_points point cloud B
-  torch::Tensor dist1 =
-    torch::zeros({batch_size, n}, torch::CUDA(torch::kFloat));
-  torch::Tensor dist2 =
-    torch::zeros({batch_size, m}, torch::CUDA(torch::kFloat));
-  torch::Tensor idx1 = torch::zeros({batch_size, n}, torch::CUDA(torch::kInt));
-  torch::Tensor idx2 = torch::zeros({batch_size, m}, torch::CUDA(torch::kInt));
+  torch::Tensor dist1 = torch::zeros(
+    {batch_size, n}, xyz1.options().dtype(torch::kFloat));
+  torch::Tensor dist2 = torch::zeros(
+    {batch_size, m}, xyz1.options().dtype(torch::kFloat));
+  torch::Tensor idx1 = torch::zeros(
+    {batch_size, n}, xyz1.options().dtype(torch::kInt));
+  torch::Tensor idx2 = torch::zeros(
+    {batch_size, m}, xyz1.options().dtype(torch::kInt));
 
   chamfer_dist_kernel<<<dim3(32, 16, 1), 512>>>(
     batch_size, n, xyz1.data_ptr<float>(), m, xyz2.data_ptr<float>(),
@@ -209,8 +211,10 @@ std::vector<torch::Tensor> chamfer_cuda_backward(torch::Tensor xyz1,
   const int batch_size    = xyz1.size(0);
   const int n             = xyz1.size(1);  // num_points point cloud A
   const int m             = xyz2.size(1);  // num_points point cloud B
-  torch::Tensor grad_xyz1 = torch::zeros_like(xyz1, torch::CUDA(torch::kFloat));
-  torch::Tensor grad_xyz2 = torch::zeros_like(xyz2, torch::CUDA(torch::kFloat));
+  torch::Tensor grad_xyz1 = torch::zeros_like(
+    xyz1, xyz1.options().dtype(torch::kFloat));
+  torch::Tensor grad_xyz2 = torch::zeros_like(
+    xyz2, xyz2.options().dtype(torch::kFloat));
 
   chamfer_dist_grad_kernel<<<dim3(1, 16, 1), 256>>>(
     batch_size, n, xyz1.data_ptr<float>(), m, xyz2.data_ptr<float>(),
