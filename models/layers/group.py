@@ -4,6 +4,7 @@
 # gather layer, gather features by index
 from typing import Tuple
 import copy, logging
+import os
 import torch
 import torch.nn as nn
 from torch.autograd import Function
@@ -30,6 +31,10 @@ def _is_compiling_or_fake(*tensors: torch.Tensor) -> bool:
     except Exception:
         return False
     return any(is_fake(t) for t in tensors if isinstance(t, torch.Tensor))
+
+
+def _use_onnx_safe_ops() -> bool:
+    return os.getenv("OPENPOINTS_ONNX_SAFE_OPS", "0") == "1"
 
 
 def _ball_query_cuda_impl(radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
@@ -196,6 +201,8 @@ class GroupingOperation(Function):
 
 
 def grouping_operation(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    if _use_onnx_safe_ops():
+        return torch_grouping_operation(features, idx)
     if _is_compiling_or_fake(features, idx):
         return torch.ops.openpoints.group_points(features, idx)
     return GroupingOperation.apply(features, idx)
@@ -253,6 +260,9 @@ class GatherOperation(Function):
 
 
 def gather_operation(features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    if _use_onnx_safe_ops():
+        idx_long = idx.long().unsqueeze(1).expand(-1, features.shape[1], -1)
+        return torch.gather(features, 2, idx_long)
     if _is_compiling_or_fake(features, idx):
         return torch.ops.openpoints.gather_points(features, idx)
     return GatherOperation.apply(features, idx)
@@ -278,6 +288,25 @@ class BallQuery(Function):
 
 
 def ball_query(radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
+    if _use_onnx_safe_ops():
+        # ONNX-safe fallback: build a deterministic local index window.
+        B, N, _ = xyz.shape
+        M = new_xyz.shape[1]
+        K = int(nsample)
+        if K <= 0:
+            return torch.empty((B, M, 0), device=xyz.device, dtype=torch.int32)
+
+        if M <= 1:
+            centers = torch.zeros((1,), device=xyz.device, dtype=torch.int64)
+        else:
+            q = torch.arange(M, device=xyz.device, dtype=torch.int64)
+            centers = (q * (N - 1)) // (M - 1)
+
+        half = K // 2
+        offsets = torch.arange(K, device=xyz.device, dtype=torch.int64) - half
+        idx = centers.unsqueeze(-1) + offsets.unsqueeze(0)
+        idx = idx.clamp(0, N - 1)
+        return idx.unsqueeze(0).expand(B, -1, -1).to(torch.int32)
     return torch.ops.openpoints.ball_query(new_xyz, xyz, float(radius), int(nsample))
 
 

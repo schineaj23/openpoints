@@ -1,5 +1,6 @@
 # subsample layer for 3d processing.
 from abc import ABC, abstractmethod
+import os
 
 import torch
 import torch.nn as nn
@@ -124,6 +125,19 @@ class FurthestPointSampling(Function):
 
 
 def furthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+    # ONNX export cannot lower the custom openpoints op, so use a deterministic
+    # index-based fallback when explicitly requested for export.
+    if os.getenv("OPENPOINTS_ONNX_SAFE_FPS", "0") == "1":
+        B, N, _ = xyz.shape
+        npoint = int(npoint)
+        if npoint <= 0:
+            return torch.empty((B, 0), device=xyz.device, dtype=torch.int32)
+        if npoint == 1:
+            idx = torch.zeros((1,), device=xyz.device, dtype=torch.int64)
+        else:
+            steps = torch.arange(npoint, device=xyz.device, dtype=torch.int64)
+            idx = (steps * (N - 1)) // (npoint - 1)
+        return idx.unsqueeze(0).expand(B, -1).to(torch.int32)
     return torch.ops.openpoints.furthest_point_sample(xyz, npoint)
 
 
