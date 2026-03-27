@@ -296,16 +296,17 @@ def ball_query(radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Te
         if K <= 0:
             return torch.empty((B, M, 0), device=xyz.device, dtype=torch.int32)
 
-        if M <= 1:
-            centers = torch.zeros((1,), device=xyz.device, dtype=torch.int64)
-        else:
-            q = torch.arange(M, device=xyz.device, dtype=torch.int64)
-            centers = (q * (N - 1)) // (M - 1)
+        q = torch.arange(M, device=xyz.device, dtype=torch.int64)
+        n_minus_1 = torch.as_tensor(N - 1, device=xyz.device, dtype=torch.int64)
+        m_minus_1 = torch.as_tensor(M - 1, device=xyz.device, dtype=torch.int64)
+        denom = torch.maximum(m_minus_1, torch.ones((), device=xyz.device, dtype=torch.int64))
+        centers = (q * n_minus_1) // denom
 
         half = K // 2
         offsets = torch.arange(K, device=xyz.device, dtype=torch.int64) - half
         idx = centers.unsqueeze(-1) + offsets.unsqueeze(0)
-        idx = idx.clamp(0, N - 1)
+        idx = torch.clamp(idx, min=0)
+        idx = torch.minimum(idx, n_minus_1)
         return idx.unsqueeze(0).expand(B, -1, -1).to(torch.int32)
     return torch.ops.openpoints.ball_query(new_xyz, xyz, float(radius), int(nsample))
 

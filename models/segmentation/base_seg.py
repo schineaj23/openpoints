@@ -44,7 +44,7 @@ class BaseSeg(nn.Module):
     def forward(self, data):
         p, f = self.encoder.forward_seg_feat(data)
         if self.decoder is not None:
-            f = self.decoder(p, f).squeeze(-1)
+            f = self.decoder(p, f)
         if self.head is not None:
             f = self.head(f)
         return f
@@ -63,7 +63,7 @@ class BasePartSeg(BaseSeg):
                 f0 = p0.transpose(1, 2).contiguous()
         p, f = self.encoder.forward_seg_feat(p0, f0)
         if self.decoder is not None:
-            f = self.decoder(p, f, cls0).squeeze(-1)
+            f = self.decoder(p, f, cls0)
         elif isinstance(f, list):
             f = f[-1]
         if self.head is not None:
@@ -84,7 +84,7 @@ class VariableSeg(BaseSeg):
 
     def forward(self, data):
         p, f, b = self.encoder.forward_seg_feat(data)
-        f = self.decoder(p, f, b).squeeze(-1)
+        f = self.decoder(p, f, b)
         return self.head(f)
 
 

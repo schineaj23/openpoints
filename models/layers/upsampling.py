@@ -105,18 +105,19 @@ def three_nn(unknown: torch.Tensor, known: torch.Tensor) -> Tuple[torch.Tensor, 
         B, N, _ = unknown.shape
         M = known.shape[1]
 
-        if M <= 1:
-            center = torch.zeros((N,), device=unknown.device, dtype=torch.int64)
-        else:
-            q = torch.arange(N, device=unknown.device, dtype=torch.int64)
-            center = (q * (M - 1)) // (N - 1 if N > 1 else 1)
+        q = torch.arange(N, device=unknown.device, dtype=torch.int64)
+        m_minus_1 = torch.as_tensor(M - 1, device=unknown.device, dtype=torch.int64)
+        n_minus_1 = torch.as_tensor(N - 1, device=unknown.device, dtype=torch.int64)
+        denom = torch.maximum(n_minus_1, torch.ones((), device=unknown.device, dtype=torch.int64))
+        center = (q * torch.maximum(m_minus_1, torch.zeros((), device=unknown.device, dtype=torch.int64))) // denom
 
-        offsets = torch.tensor([-1, 0, 1], device=unknown.device, dtype=torch.int64)
+        offsets = torch.arange(-1, 2, device=unknown.device, dtype=torch.int64)
         idx = center.unsqueeze(-1) + offsets.unsqueeze(0)
-        idx = idx.clamp(0, M - 1)
+        idx = torch.clamp(idx, min=0)
+        idx = torch.minimum(idx, torch.maximum(m_minus_1, torch.zeros((), device=unknown.device, dtype=torch.int64)))
         idx = idx.unsqueeze(0).expand(B, -1, -1)
 
-        # Keep distances simple and stable for ONNX export/runtime.
+        # Keep distances simple and stable for export/runtime.
         nn_dist = torch.ones((B, N, 3), device=unknown.device, dtype=unknown.dtype)
         return nn_dist, idx.to(torch.int32)
     if _is_compiling_or_fake(unknown, known):
